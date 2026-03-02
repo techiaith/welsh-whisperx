@@ -1,0 +1,80 @@
+services:
+
+  application:
+     image: techiaith/whisperx-api
+     # Removed container_name to allow potential scaling
+     restart: always
+     environment:
+       - REDIS_HOST=${REDIS_HOST}
+       - REDIS_PORT=${REDIS_PORT}
+       - CLEANUP_ENABLED=${CLEANUP_ENABLED}
+       - FILE_RETENTION_DAYS=${FILE_RETENTION_DAYS}
+       - CLEANUP_SCHEDULE=${CLEANUP_SCHEDULE}
+       - RECORDINGS_DIR=${RECORDINGS_DIR}
+     build:
+       context: ${PWD}/api
+       dockerfile: Dockerfile
+     ports:
+       - "5511:8000"
+     volumes:
+       - ${PWD}/recordings:/recordings
+     depends_on:
+       - redis
+
+
+  # High-priority worker: /transcribe/ and /keyboard/ requests
+  worker-high:
+    image: techiaith/whisperx-worker-cpu
+    restart: always
+    environment:
+      - WORKER_QUEUES=high_priority
+      - WHISPER_MODEL_NAME=${WHISPER_MODEL_NAME}
+      - WHISPER_MODEL_DEVICE=cpu
+      - WHISPER_MODEL_LANGUAGE=${WHISPER_MODEL_LANGUAGE}
+      - WAV2VEC2_MODEL=${WAV2VEC2_MODEL}
+      - HF_AUTH_TOKEN=${HF_AUTH_TOKEN}
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - TORCH_FORCE_WEIGHTS_ONLY_LOAD=0
+    build:
+      context: ${PWD}/worker
+      dockerfile: Dockerfile
+      args:
+        DEVICE: cpu
+    volumes:
+       - ${PWD}/recordings:/recordings
+    depends_on:
+       - redis
+
+  # Default worker: /transcribe_long_form/ requests (normal and low priority)
+  # No build: section — uses the image built by worker-high
+  worker-default:
+    image: techiaith/whisperx-worker-cpu
+    restart: always
+    environment:
+      - WORKER_QUEUES=default
+      - WHISPER_MODEL_NAME=${WHISPER_MODEL_NAME}
+      - WHISPER_MODEL_DEVICE=cpu
+      - WHISPER_MODEL_LANGUAGE=${WHISPER_MODEL_LANGUAGE}
+      - WAV2VEC2_MODEL=${WAV2VEC2_MODEL}
+      - HF_AUTH_TOKEN=${HF_AUTH_TOKEN}
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - TORCH_FORCE_WEIGHTS_ONLY_LOAD=0
+    volumes:
+       - ${PWD}/recordings:/recordings
+    depends_on:
+       - redis
+
+
+  redis:
+    image: redis:7.2.1
+    # Keep container_name for Redis as it's a singleton service
+    container_name: whisperx-redis
+    hostname: redis
+    restart: always
+    volumes:
+       - redis_data:/data
+
+volumes:
+    redis_data: {}

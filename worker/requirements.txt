@@ -1,0 +1,10 @@
+whisperx==3.7.6
+celery
+redis
+fleep
+pympi-ling
+yt-dlp
+pydub
+ffmpeg-normalize
+SciPy
+lingua-language-detector

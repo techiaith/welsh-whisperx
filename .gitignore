@@ -1,0 +1,16 @@
+recordings
+tmp
+logs
+data
+redis_data
+environment_variables
+.idea
+.serena
+mlx_models
+
+# Environment files with secrets
+.env
+.env.secrets
+
+# Build state
+.device
