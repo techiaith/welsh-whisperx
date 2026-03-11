@@ -31,6 +31,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
+              device_ids: ['${CUDA_DEVICE_INDEX:-0}']
               capabilities: [gpu]
     restart: always
     environment:
@@ -43,6 +44,9 @@ services:
       - REDIS_HOST=${REDIS_HOST}
       - REDIS_PORT=${REDIS_PORT}
       - TORCH_FORCE_WEIGHTS_ONLY_LOAD=0
+      - DIARIZE_MIN_DURATION_SECONDS=${DIARIZE_MIN_DURATION_SECONDS:-30}
+      - SAVE_FILES_MIN_DURATION_SECONDS=${SAVE_FILES_MIN_DURATION_SECONDS:-30}
+      - ALIGN_MIN_DURATION_SECONDS=${ALIGN_MIN_DURATION_SECONDS:-30}
     build:
       context: ${PWD}/worker
       dockerfile: Dockerfile
@@ -63,6 +67,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
+              device_ids: ['${CUDA_DEVICE_INDEX:-0}']
               capabilities: [gpu]
     restart: always
     environment:
@@ -75,6 +80,9 @@ services:
       - REDIS_HOST=${REDIS_HOST}
       - REDIS_PORT=${REDIS_PORT}
       - TORCH_FORCE_WEIGHTS_ONLY_LOAD=0
+      - DIARIZE_MIN_DURATION_SECONDS=${DIARIZE_MIN_DURATION_SECONDS:-30}
+      - SAVE_FILES_MIN_DURATION_SECONDS=${SAVE_FILES_MIN_DURATION_SECONDS:-30}
+      - ALIGN_MIN_DURATION_SECONDS=${ALIGN_MIN_DURATION_SECONDS:-30}
     volumes:
        - ${PWD}/recordings:/recordings
     depends_on:
