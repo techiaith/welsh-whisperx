@@ -11,7 +11,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File, Request, Form, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from celery import Celery
@@ -59,7 +59,6 @@ tags_metadata = [
     {"name": "Cyfieithu / Translation", "description": "Lleferydd Cymraeg i destun Saesneg / Welsh speech to English text"},
     {"name": "Alinio / Alignment", "description": "Alinio testun i sain gan ddefnyddio wav2vec2 / Align text to audio using wav2vec2"},
     {"name": "Canlyniadau / Results", "description": "Lawrlwytho canlyniadau trawsgrifio / Download transcription results"},
-    {"name": "Monitro / Monitoring", "description": "Iechyd y gwasanaeth, ciwiau a glanhau / Service health, queues and cleanup"},
 ]
 
 app = FastAPI(
@@ -110,7 +109,7 @@ celery.conf.update(
 )
 
 
-@app.get('/version/', tags=["Monitro / Monitoring"])
+@app.get('/version/', include_in_schema=False)
 async def version():
     """Fersiwn yr API / API version number."""
     return {
@@ -201,7 +200,7 @@ async def transcribe(
     return result
 
 
-@app.post('/keyboard/', response_class=FileResponse, tags=["Trawsgrifio / Transcription"])
+@app.post('/keyboard/', response_class=PlainTextResponse, tags=["Trawsgrifio / Transcription"])
 async def transcribe_for_keyboard(
     audio_file: UploadFile = File(..., description="Ffeil sain / Audio file (wav, mp3, ogg, etc.)"),
 ):
@@ -228,13 +227,20 @@ async def transcribe_for_keyboard(
             priority=0
         )
         task_result = transcription_task.get(timeout=60.0)
-        txt_file_path = Path(os.path.join(UPLOAD_DIR, stt_id + ".txt"))
+
+        # Extract text directly from task result (no file dependency)
+        text = ''
+        for segment in task_result.get('segments', []):
+            text = text + segment.get('text', '').strip()
+            if text.endswith('.'):
+                text = text + ' '
+        text = text.strip()
+
         logger.info(f"[API] Transcription completed successfully")
-        return txt_file_path
+        return text
     else:
         logger.warning(f"[API] Audio file too large ({audio_file_size} bytes)")
-        result = ""
-        return result
+        return ""
     
 
 @app.post('/transcribe_long_form/', tags=["Trawsgrifio / Transcription"])
@@ -535,7 +541,7 @@ async def delete(stt_id: str = Depends(validate_stt_id)):
     return response
 
 
-@app.get('/health/', tags=["Monitro / Monitoring"])
+@app.get('/health/', include_in_schema=False)
 async def health():
     """Gwiriad iechyd cynhwysfawr — Redis, gweithwyr Celery, a statws modelau.
 
@@ -543,7 +549,7 @@ async def health():
     return await get_comprehensive_health(celery)
 
 
-@app.get('/health/ready/', tags=["Monitro / Monitoring"])
+@app.get('/health/ready/', include_in_schema=False)
 async def readiness():
     """Prawf parodrwydd ar gyfer llwyth-gydbwysyddion. 200 os yn barod, 503 fel arall.
 
@@ -557,7 +563,7 @@ async def readiness():
         )
 
 
-@app.get('/health/live/', tags=["Monitro / Monitoring"])
+@app.get('/health/live/', include_in_schema=False)
 async def liveness():
     """Prawf bywiogrwydd — 200 os yw'r broses API yn fyw ac yn ymateb.
 
@@ -565,7 +571,7 @@ async def liveness():
     return await check_liveness()
 
 
-@app.get('/queue/status/', tags=["Monitro / Monitoring"])
+@app.get('/queue/status/', include_in_schema=False)
 async def queue_status():
     """Archwilio statws ciwiau Celery — tasgau gweithredol, wedi'u trefnu a chadw.
 
@@ -573,7 +579,7 @@ async def queue_status():
     return await get_queue_status(celery)
 
 
-@app.post('/cleanup/run/', tags=["Monitro / Monitoring"])
+@app.post('/cleanup/run/', include_in_schema=False)
 async def cleanup_run():
     """Sbarduno glanhau ffeiliau hen â llaw.
 
@@ -581,7 +587,7 @@ async def cleanup_run():
     return await run_cleanup_now()
 
 
-@app.get('/cleanup/status/', tags=["Monitro / Monitoring"])
+@app.get('/cleanup/status/', include_in_schema=False)
 async def cleanup_status(request: Request):
     """Statws a chyfluniad y trefnydd glanhau.
 

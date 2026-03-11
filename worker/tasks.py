@@ -105,12 +105,16 @@ def speech_to_text(self, audio_file_path, task='transcribe'):
         # Convert numpy array slice to bytes efficiently
         return hashlib.md5(audio_segment.tobytes()).hexdigest()
 
-    def whisperx_transcribe(audio, lang='', task='transcribe'):
+    def whisperx_transcribe(audio, lang='', task='transcribe', skip_alignment=False):
         # transcribe or translate
         whisper_result = self.model.transcribe(audio, batch_size=2, language=lang, task=task)
 
         if task == 'translate':
             # Skip alignment — Welsh wav2vec2 can't align English text
+            return whisper_result
+
+        if skip_alignment:
+            # Skip alignment for short audio (voice assistant optimization)
             return whisper_result
 
         # align
@@ -136,16 +140,30 @@ def speech_to_text(self, audio_file_path, task='transcribe'):
     logger.info(f"[WORKER] Loading audio file into numpy array")
     audio = whisperx.load_audio(wav_audio_file_path, sr=sampling_rate)
 
+    # Calculate duration for short audio optimizations
+    audio_duration_seconds = len(audio) / sampling_rate
+    align_min_duration = float(os.environ.get('ALIGN_MIN_DURATION_SECONDS', 30))
+    skip_alignment = audio_duration_seconds < align_min_duration
+
+    if skip_alignment:
+        logger.info(f"[WORKER] Short audio ({audio_duration_seconds:.1f}s < {align_min_duration:.0f}s) — will skip alignment")
+
     logger.info(f"[WORKER] Starting WhisperX {task}")
-    whisperx_result = whisperx_transcribe(audio, task=task)
+    whisperx_result = whisperx_transcribe(audio, task=task, skip_alignment=skip_alignment)
     total_segments = len(whisperx_result.get('segments', []))
     logger.info(f"[WORKER] WhisperX {task} complete, {total_segments} segments found")
 
     # Translation: skip diarization (no alignment data, English output)
     # Transcription: full pipeline with diarization and speaker assignment
+    # Short audio: skip diarization (configurable threshold)
     diarize_segments = None
+    diarize_min_duration = float(os.environ.get('DIARIZE_MIN_DURATION_SECONDS', 30))
+
     if task == 'translate':
         logger.info(f"[WORKER] Translation mode — skipping diarization")
+        result = whisperx_result
+    elif audio_duration_seconds < diarize_min_duration:
+        logger.info(f"[WORKER] Short audio ({audio_duration_seconds:.1f}s < {diarize_min_duration:.0f}s) — skipping diarization")
         result = whisperx_result
     else:
         logger.info(f"[WORKER] Starting speaker diarization")
@@ -293,12 +311,18 @@ def speech_to_text(self, audio_file_path, task='transcribe'):
 
     logger.info(f"[WORKER] Processed {len(segments)} segments, saving output files")
     save_as_json(wav_audio_file_path, result, logger)
-    save_as_text(wav_audio_file_path, result, logger)
-    save_as_elan(wav_audio_file_path, result, logger)
-    save_as_srt(wav_audio_file_path, result, language_code, logger)
-    save_as_vtt(wav_audio_file_path, result, language_code, logger)
 
-    logger.info(f"[WORKER] All output files saved successfully. Task complete.")
+    # Skip additional output formats for short audio (voice assistant optimization)
+    save_files_min_duration = float(os.environ.get('SAVE_FILES_MIN_DURATION_SECONDS', 30))
+    if audio_duration_seconds < save_files_min_duration:
+        logger.info(f"[WORKER] Short audio ({audio_duration_seconds:.1f}s < {save_files_min_duration:.0f}s) — skipping txt/srt/vtt/elan files")
+    else:
+        save_as_text(wav_audio_file_path, result, logger)
+        save_as_elan(wav_audio_file_path, result, logger)
+        save_as_srt(wav_audio_file_path, result, language_code, logger)
+        save_as_vtt(wav_audio_file_path, result, language_code, logger)
+
+    logger.info(f"[WORKER] Output files saved successfully. Task complete.")
 
     # Return result before cleanup (caller needs segments)
     result_to_return = result.copy()
