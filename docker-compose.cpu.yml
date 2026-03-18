@@ -67,6 +67,28 @@ services:
        - redis
 
 
+  # Alignment workers: handle /align/ and /align_long_form/ requests.
+  # Two replicas so a long alignment doesn't block short /align/ requests.
+  worker-alignment:
+    image: techiaith/whisperx-worker-cpu
+    deploy:
+      replicas: 2
+    restart: always
+    environment:
+      - WORKER_QUEUES=alignment
+      - WHISPER_MODEL_NAME=${WHISPER_MODEL_NAME}
+      - WHISPER_MODEL_DEVICE=cpu
+      - WHISPER_MODEL_LANGUAGE=${WHISPER_MODEL_LANGUAGE}
+      - WAV2VEC2_MODEL=${WAV2VEC2_MODEL}
+      - HF_AUTH_TOKEN=${HF_AUTH_TOKEN}
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - TORCH_FORCE_WEIGHTS_ONLY_LOAD=0
+    volumes:
+       - ${PWD}/recordings:/recordings
+    depends_on:
+       - redis
+
   redis:
     image: redis:7.2.1
     # Keep container_name for Redis as it's a singleton service

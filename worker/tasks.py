@@ -355,6 +355,9 @@ def align_audio(self, audio_file_path, text):
     Accepts a single text block and aligns it against the entire audio file,
     returning word-level timestamps and confidence scores.
     No transcription (Whisper) is needed — uses wav2vec2 CTC alignment directly.
+
+    Runs on a dedicated CPU-only worker (alignment queue) to avoid CUDA OOM
+    on long audio and to keep GPU workers free for transcription.
     """
     sampling_rate = 16000
 
@@ -370,10 +373,37 @@ def align_audio(self, audio_file_path, text):
     duration = len(audio) / float(sampling_rate)
     logger.info(f"[WORKER] Audio loaded, duration: {duration:.2f}s")
 
+    # Validate text-to-audio ratio to reject absurd jobs
+    # (e.g. 3 words for 20 minutes of audio will hang the worker)
+    word_count = len(text.split())
+    min_words_per_second = 0.1  # At least 1 word per 10 seconds of audio
+    if duration > 0 and word_count / duration < min_words_per_second:
+        ratio = word_count / duration
+        logger.warning(
+            f"[WORKER] Rejecting alignment: text too short for audio duration. "
+            f"{word_count} words / {duration:.1f}s = {ratio:.4f} words/sec "
+            f"(minimum: {min_words_per_second})"
+        )
+        # Cleanup
+        del audio
+        gc.collect()
+        error_result = {
+            'id': audio_id,
+            'version': 2,
+            'success': False,
+            'message': (
+                f"Text too short for audio duration: {word_count} words for {duration:.0f}s of audio "
+                f"({ratio:.4f} words/sec). Minimum ratio: {min_words_per_second} words/sec "
+                f"(~1 word per 10 seconds). Please provide more text or shorter audio."
+            )
+        }
+        save_as_json(wav_audio_file_path, error_result, logger)
+        return error_result
+
     # Single segment: align the entire text against the full audio
     segments = [{"start": 0.0, "end": duration, "text": text}]
 
-    logger.info(f"[WORKER] Starting wav2vec2 forced alignment")
+    logger.info(f"[WORKER] Starting wav2vec2 forced alignment on {self.device}")
     aligned = whisperx.align(
         segments,
         self.align_model,
@@ -404,7 +434,8 @@ def align_audio(self, audio_file_path, text):
         'word_segments': aligned.get('word_segments', [])
     }
 
-    logger.info(f"[WORKER] Alignment task complete. Returning result.")
+    logger.info(f"[WORKER] Alignment task complete. Saving result.")
+    save_as_json(wav_audio_file_path, result, logger)
 
     # Cleanup
     del audio

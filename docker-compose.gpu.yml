@@ -89,6 +89,31 @@ services:
        - redis
 
 
+  # Alignment workers: CPU-only, handle /align/ and /align_long_form/ requests.
+  # Runs wav2vec2 on CPU to avoid CUDA OOM on long audio files.
+  # No GPU reservation needed — wav2vec2 is small and CPU is fast enough.
+  # Two replicas so a long alignment doesn't block short /align/ requests.
+  # Scale further with: docker compose -f docker-compose.gpu.yml up -d --scale worker-alignment=N
+  worker-alignment:
+    image: techiaith/whisperx-worker
+    deploy:
+      replicas: 2
+    restart: always
+    environment:
+      - WORKER_QUEUES=alignment
+      - WHISPER_MODEL_NAME=${WHISPER_MODEL_NAME}
+      - WHISPER_MODEL_DEVICE=cpu
+      - WHISPER_MODEL_LANGUAGE=${WHISPER_MODEL_LANGUAGE}
+      - WAV2VEC2_MODEL=${WAV2VEC2_MODEL}
+      - HF_AUTH_TOKEN=${HF_AUTH_TOKEN}
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - TORCH_FORCE_WEIGHTS_ONLY_LOAD=0
+    volumes:
+       - ${PWD}/recordings:/recordings
+    depends_on:
+       - redis
+
   redis:
     image: redis:7.2.1
     # Keep container_name for Redis as it's a singleton service

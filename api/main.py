@@ -86,7 +86,8 @@ celery = Celery('tasks', broker=BROKER_CONN_URI, backend=BACKEND_CONN_URI)
 #
 # Queue routing (processed in order):
 #   1. high_priority: Keyboard/real-time (checked first)
-#   2. default: Normal batch (checked second)
+#   2. default: Normal batch transcription/translation (checked second)
+#   3. alignment: CPU-only alignment tasks (separate worker, no GPU needed)
 #
 # Within each queue, numeric priorities apply:
 #   0 = urgent, 5 = normal, 9 = low
@@ -101,7 +102,7 @@ celery.conf.update(
     task_default_queue='default',  # Default to normal queue
     task_routes={
         'speech_to_text': {'queue': 'default'},  # Can be overridden at send time
-        'align_audio': {'queue': 'default'},      # Can be overridden at send time
+        'align_audio': {'queue': 'alignment'},   # CPU-only worker, can be overridden at send time
     },
     task_queue_max_priority=10,      # Enable priorities 0-9 within each queue
     task_default_priority=5,         # Default to normal priority
@@ -245,39 +246,26 @@ async def transcribe_for_keyboard(
 
 @app.post('/transcribe_long_form/', tags=["Trawsgrifio / Transcription"])
 async def transcribe_long_form(
-    request: Request,
     soundfile: UploadFile = File(..., description="Ffeil sain / Audio file (unrhyw faint / any size)"),
-    priority: str = Form('normal', description="Blaenoriaeth / Priority: 'normal' neu/or 'low' (mae 'high' yn cael ei israddio / 'high' is demoted to 'normal')")
 ):
     """Trawsgrifio sain hir yn anghydamserol. Dim terfyn maint.
     Dychwelyd ID ar unwaith — defnyddiwch /get_json/, /get_srt/ ayb i nôl canlyniadau.
 
     Transcribe long audio asynchronously. No file size limit.
     Returns an ID immediately — use /get_json/, /get_srt/ etc. to retrieve results."""
-    #
     stt_id = str(uuid.uuid4())
     logger = get_logger(stt_id)
-
-    # Cap priority at 'normal' - demote 'high' requests
-    if priority == 'high':
-        priority = 'normal'
-        logger.info(f"[API] New transcription request - endpoint: /transcribe_long_form/, stt_id: {stt_id}, priority: {priority} (demoted from high)")
-    else:
-        logger.info(f"[API] New transcription request - endpoint: /transcribe_long_form/, stt_id: {stt_id}, priority: {priority}")
+    logger.info(f"[API] New transcription request - endpoint: /transcribe_long_form/, stt_id: {stt_id}")
 
     audio_file_path, audio_file_size = await save_sound_file(stt_id, soundfile)
     logger.info(f"[API] Audio file saved: {audio_file_path}, size: {audio_file_size} bytes")
 
-    # /transcribe_long_form/ always routes to default queue
-    # Maximum priority is 'normal' (5) - 'high' is demoted above
-    task_priority = 9 if priority == 'low' else 5
-
-    logger.info(f"[API] Sending task to queue 'default' with priority {task_priority} ({priority}) for processing")
+    logger.info(f"[API] Sending task to queue 'default' with priority 5 (normal) for processing")
     transcription_task = celery.send_task(
         'speech_to_text',
         args=(audio_file_path, 'transcribe'),
         queue='default',
-        priority=task_priority
+        priority=5
     )
     task_store.set_task_id(stt_id, transcription_task.task_id)
     logger.info(f"[API] Task sent to Celery, task_id: {transcription_task.task_id}")
@@ -331,9 +319,7 @@ async def translate(
 
 @app.post('/translate_long_form/', tags=["Cyfieithu / Translation"])
 async def translate_long_form(
-    request: Request,
     soundfile: UploadFile = File(..., description="Ffeil sain Cymraeg / Welsh audio file (unrhyw faint / any size)"),
-    priority: str = Form('normal', description="Blaenoriaeth / Priority: 'normal' neu/or 'low' (mae 'high' yn cael ei israddio / 'high' is demoted to 'normal')")
 ):
     """Cyfieithu sain Cymraeg hir i destun Saesneg yn anghydamserol. Dim terfyn maint.
     Dychwelyd ID ar unwaith — defnyddiwch /get_json/, /get_srt/ ayb i nôl canlyniadau.
@@ -342,25 +328,17 @@ async def translate_long_form(
     Returns an ID immediately — use /get_json/, /get_srt/ etc. to retrieve results."""
     stt_id = str(uuid.uuid4())
     logger = get_logger(stt_id)
-
-    # Cap priority at 'normal' — demote 'high' requests
-    if priority == 'high':
-        priority = 'normal'
-        logger.info(f"[API] New translation request - endpoint: /translate_long_form/, stt_id: {stt_id}, priority: {priority} (demoted from high)")
-    else:
-        logger.info(f"[API] New translation request - endpoint: /translate_long_form/, stt_id: {stt_id}, priority: {priority}")
+    logger.info(f"[API] New translation request - endpoint: /translate_long_form/, stt_id: {stt_id}")
 
     audio_file_path, audio_file_size = await save_sound_file(stt_id, soundfile)
     logger.info(f"[API] Audio file saved: {audio_file_path}, size: {audio_file_size} bytes")
 
-    task_priority = 9 if priority == 'low' else 5
-
-    logger.info(f"[API] Sending translate task to queue 'default' with priority {task_priority} ({priority})")
+    logger.info(f"[API] Sending translate task to queue 'default' with priority 5 (normal)")
     translation_task = celery.send_task(
         'speech_to_text',
         args=(audio_file_path, 'translate'),
         queue='default',
-        priority=task_priority
+        priority=5
     )
     task_store.set_task_id(stt_id, translation_task.task_id)
     logger.info(f"[API] Task sent to Celery, task_id: {translation_task.task_id}")
@@ -392,11 +370,11 @@ async def align_audio_endpoint(
     logger.info(f"[API] Audio file saved: {audio_file_path}, size: {audio_file_size} bytes")
 
     if audio_file_size < 480000:
-        logger.info(f"[API] Sending align task to queue 'high_priority' with priority 0 (urgent)")
+        logger.info(f"[API] Sending align task to queue 'alignment' with priority 0 (urgent)")
         align_task = celery.send_task(
             'align_audio',
             args=(audio_file_path, text),
-            queue='high_priority',
+            queue='alignment',
             priority=0
         )
         task_result = align_task.get(timeout=60.0)
@@ -412,6 +390,40 @@ async def align_audio_endpoint(
         }
 
     return result
+
+
+@app.post('/align_long_form/', tags=["Alinio / Alignment"])
+async def align_long_form(
+    soundfile: UploadFile = File(..., description="Ffeil sain / Audio file (unrhyw faint / any size)"),
+    text: str = Form(..., description="Y testun i'w alinio â'r sain / Text to align against the audio"),
+):
+    """Alinio testun â sain hir yn anghydamserol gan ddefnyddio wav2vec2 forced alignment. Dim terfyn maint.
+    Dychwelyd ID ar unwaith — defnyddiwch /get_json/ ayb i nôl canlyniadau.
+
+    Align text to long audio asynchronously using wav2vec2 forced alignment. No file size limit.
+    Returns an ID immediately — use /get_json/ etc. to retrieve results."""
+    stt_id = str(uuid.uuid4())
+    logger = get_logger(stt_id)
+    logger.info(f"[API] New alignment request - endpoint: /align_long_form/, stt_id: {stt_id}, text length: {len(text)} chars")
+
+    audio_file_path, audio_file_size = await save_sound_file(stt_id, soundfile)
+    logger.info(f"[API] Audio file saved: {audio_file_path}, size: {audio_file_size} bytes")
+
+    logger.info(f"[API] Sending align task to queue 'alignment' with priority 5 (normal)")
+    align_task = celery.send_task(
+        'align_audio',
+        args=(audio_file_path, text),
+        queue='alignment',
+        priority=5
+    )
+    task_store.set_task_id(stt_id, align_task.task_id)
+    logger.info(f"[API] Task sent to Celery, task_id: {align_task.task_id}")
+
+    return {
+        'id': stt_id,
+        'version': 2,
+        'success': True
+    }
 
 
 @app.get('/get_speakers/', response_class=FileResponse, tags=["Canlyniadau / Results"])

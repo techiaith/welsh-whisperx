@@ -212,16 +212,9 @@ curl -X POST "http://localhost:5511/transcribe/" \
 
 ### Trawsgrifio Sain Hir (Anghydamserol)
 ```bash
-# Cyflwyno tasg (rhagosodiad: blaenoriaeth normal, wedi'i lwybro i giw default)
+# Cyflwyno tasg (wedi'i lwybro i giw default)
 curl -X POST "http://localhost:5511/transcribe_long_form/" \
   -F "soundfile=@sain_hir.wav"
-
-# Blaenoriaeth isel (swydd gefndir)
-curl -X POST "http://localhost:5511/transcribe_long_form/" \
-  -F "soundfile=@sain_hir.wav" \
-  -F "priority=low"
-
-# Noder: mae blaenoriaeth 'high' yn cael ei diraddio i 'normal' ar y diweddbwynt hwn
 
 # Dychwelyd: {"id": "uuid", "version": 2, "success": true}
 
@@ -247,9 +240,21 @@ curl -X POST "http://localhost:5511/translate_long_form/" \
 
 ### Alinio Testun â Sain (Stampiau Amser fesul Gair)
 ```bash
+# Ffurf fer (cydamserol, uchafswm 480KB)
 curl -X POST "http://localhost:5511/align/" \
   -F "soundfile=@sain.wav" \
   -F "text=Mae ganddynt dau o blant, mab a merch"
+
+# Ffurf hir (anghydamserol, unrhyw faint — yn rhedeg ar CPU)
+curl -X POST "http://localhost:5511/align_long_form/" \
+  -F "soundfile=@sain_hir.wav" \
+  -F "text=Testun llawn i'w alinio â'r sain..."
+
+# Gwirio statws
+curl "http://localhost:5511/get_status/?stt_id=<uuid>"
+
+# Cael canlyniadau
+curl "http://localhost:5511/get_json/?stt_id=<uuid>"
 ```
 
 ### Mewnbwn Bysellfwrdd Amser Real (Blaenoriaeth Uchel Bob Amser)
@@ -276,23 +281,25 @@ curl -X POST "http://localhost:5511/keyboard/" \
 │  Brocer Redis    │  Porth 6379
 │  (Ciw Tasgau)    │
 ├──────────────────┤
-│ high_priority    │  /transcribe/, /keyboard/, /translate/, /align/
+│ high_priority    │  /transcribe/, /keyboard/, /translate/
 │ default          │  /transcribe_long_form/, /translate_long_form/
-└───────┬──┬───────┘
-        │  │
-        ▼  ▼
-┌────────┐ ┌─────────┐
-│worker  │ │worker   │  Yn Raddadwy'n
-│-high   │ │-default │  Annibynnol
-│(GPU)   │ │(GPU)    │
-└────────┘ └─────────┘
+│ alignment        │  /align/, /align_long_form/
+└──┬───┬───┬───────┘
+   │   │   │
+   ▼   ▼   ▼
+┌────────┐ ┌─────────┐ ┌───────────┐
+│worker  │ │worker   │ │worker     │  Yn Raddadwy'n
+│-high   │ │-default │ │-alignment │  Annibynnol
+│(GPU)   │ │(GPU)    │ │(CPU x2)   │
+└────────┘ └─────────┘ └───────────┘
 ```
 
 ### Gwasanaethau
 
 - **Application (FastAPI)**: Gweinydd API REST yn trin ceisiadau
-- **worker-high (Celery)**: Pwrpasol ar gyfer tasgau blaenoriaeth uchel (`/transcribe/`, `/keyboard/`, `/translate/`, `/align/`)
+- **worker-high (Celery)**: Pwrpasol ar gyfer tasgau blaenoriaeth uchel (`/transcribe/`, `/keyboard/`, `/translate/`)
 - **worker-default (Celery)**: Pwrpasol ar gyfer tasgau rhagosodedig (`/transcribe_long_form/`, `/translate_long_form/`)
+- **worker-alignment (Celery)**: Pwrpasol ar gyfer alinio ar CPU (`/align/`, `/align_long_form/`) — 2 replica rhag ofn bod tasg hir yn rhwystro
 - **Redis**: Brocer negeseuon a storfa canlyniadau
 
 ### System Ciwiau a Blaenoriaethu Tasgau
@@ -306,26 +313,27 @@ Mae'r system yn defnyddio **blaenoriaethu dwy lefel**: gweithwyr ciw pwrpasol + 
 | `/keyboard/` | `high_priority` | 0 (brys) | Bob amser yn frys, dim paramedr blaenoriaeth |
 | `/transcribe/` | `high_priority` | 0 (uchel) | Yn derbyn `high` neu `normal` |
 | `/translate/` | `high_priority` | 0 (uchel) | Cyfieithu Cymraeg → Saesneg |
-| `/align/` | `high_priority` | 0 (brys) | Alinio testun â sain, stampiau amser fesul gair |
-| `/transcribe_long_form/` | `default` | 5 (normal) | Yn derbyn `normal` neu `low`. Mae `high` yn cael ei ddiraddio i `normal` |
-| `/translate_long_form/` | `default` | 5 (normal) | Cyfieithu anghydamserol. Yn derbyn `normal` neu `low` |
+| `/transcribe_long_form/` | `default` | 5 (normal) | Anghydamserol, dim paramedr blaenoriaeth |
+| `/translate_long_form/` | `default` | 5 (normal) | Cyfieithu anghydamserol, dim paramedr blaenoriaeth |
+| `/align/` | `alignment` | 0 (brys) | Alinio testun â sain, stampiau amser fesul gair (CPU) |
+| `/align_long_form/` | `alignment` | 5 (normal) | Alinio sain hir yn anghydamserol (CPU) |
 
 #### Aseiniad Ciwiau Gweithwyr
 
 Mae gweithwyr yn cael eu neilltuo i giwiau penodol trwy'r newidyn amgylchedd `WORKER_QUEUES`:
 
-| Gweithiwr | Ciwiau | Yn Gwasanaethu |
-|-----------|--------|----------------|
-| `worker-high` | `high_priority` | `/transcribe/`, `/keyboard/`, `/translate/`, `/align/` |
-| `worker-default` | `default` | `/transcribe_long_form/`, `/translate_long_form/` |
+| Gweithiwr | Ciwiau | Dyfais | Yn Gwasanaethu |
+|-----------|--------|--------|----------------|
+| `worker-high` | `high_priority` | GPU | `/transcribe/`, `/keyboard/`, `/translate/` |
+| `worker-default` | `default` | GPU | `/transcribe_long_form/`, `/translate_long_form/` |
+| `worker-alignment` (x2) | `alignment` | CPU | `/align/`, `/align_long_form/` |
 
 #### Blaenoriaethau Rhifol (o fewn pob ciw)
 
 | Gwerth | Enw | Defnyddir Gan |
 |--------|-----|---------------|
 | 0 | brys | `/keyboard/`, `/transcribe/` gyda `priority=high`, `/translate/`, `/align/` |
-| 5 | normal | `/transcribe/` gyda `priority=normal`, `/transcribe_long_form/`, `/translate_long_form/` |
-| 9 | isel | `/transcribe_long_form/` gyda `priority=low`, `/translate_long_form/` gyda `priority=low` |
+| 5 | normal | `/transcribe/` gyda `priority=normal`, `/transcribe_long_form/`, `/translate_long_form/`, `/align_long_form/` |
 
 ---
 
@@ -510,6 +518,10 @@ services:
   worker-default:
     environment:
       - WORKER_QUEUES=default          # Tasgau rhagosodedig yn unig
+
+  worker-alignment:
+    environment:
+      - WORKER_QUEUES=alignment        # Tasgau alinio yn unig (CPU)
 ```
 
 I greu gweithiwr sy'n trin y ddau giw (defnyddiol ar gyfer defnyddiadau bach):
@@ -604,7 +616,7 @@ Yna, ewch wedyn i http://localhost:5511
 ### Tasgau'n sownd yn y ciw
 - Gwirio statws gweithwyr: `make status`
 - Archwilio'r ciw: `curl http://localhost:5511/queue/status/`
-- Ailgychwyn gweithwyr: `docker compose -f docker-compose.gpu.yml restart worker-high worker-default`
+- Ailgychwyn gweithwyr: `docker compose -f docker-compose.gpu.yml restart worker-high worker-default worker-alignment`
 
 ---
 
@@ -787,16 +799,9 @@ curl -X POST "http://localhost:5511/transcribe/" \
 
 ### Transcribe Long Audio (Asynchronous)
 ```bash
-# Submit task (default: normal priority, routed to default queue)
+# Submit task (routed to default queue)
 curl -X POST "http://localhost:5511/transcribe_long_form/" \
   -F "soundfile=@long_audio.wav"
-
-# Low priority (background job)
-curl -X POST "http://localhost:5511/transcribe_long_form/" \
-  -F "soundfile=@long_audio.wav" \
-  -F "priority=low"
-
-# Note: 'high' priority is demoted to 'normal' on this endpoint
 
 # Returns: {"id": "uuid", "version": 2, "success": true}
 
@@ -822,9 +827,21 @@ curl -X POST "http://localhost:5511/translate_long_form/" \
 
 ### Align Text to Audio (Word-level Timestamps)
 ```bash
+# Short form (synchronous, max 480KB)
 curl -X POST "http://localhost:5511/align/" \
   -F "soundfile=@audio.wav" \
   -F "text=Mae ganddynt dau o blant, mab a merch"
+
+# Long form (asynchronous, any size — runs on CPU)
+curl -X POST "http://localhost:5511/align_long_form/" \
+  -F "soundfile=@long_audio.wav" \
+  -F "text=Full text to align against the audio..."
+
+# Check status
+curl "http://localhost:5511/get_status/?stt_id=<uuid>"
+
+# Get results
+curl "http://localhost:5511/get_json/?stt_id=<uuid>"
 ```
 
 ### Real-time Keyboard Input (Always High Priority)
@@ -851,23 +868,25 @@ curl -X POST "http://localhost:5511/keyboard/" \
 │   Redis Broker   │  Port 6379
 │   (Task Queue)   │
 ├──────────────────┤
-│ high_priority    │  /transcribe/, /keyboard/, /translate/, /align/
+│ high_priority    │  /transcribe/, /keyboard/, /translate/
 │ default          │  /transcribe_long_form/, /translate_long_form/
-└───────┬──┬───────┘
-        │  │
-        ▼  ▼
-┌────────┐ ┌─────────┐
-│worker  │ │worker   │  Independently
-│-high   │ │-default │  Scalable
-│(GPU)   │ │(GPU)    │
-└────────┘ └─────────┘
+│ alignment        │  /align/, /align_long_form/
+└──┬───┬───┬───────┘
+   │   │   │
+   ▼   ▼   ▼
+┌────────┐ ┌─────────┐ ┌───────────┐
+│worker  │ │worker   │ │worker     │  Independently
+│-high   │ │-default │ │-alignment │  Scalable
+│(GPU)   │ │(GPU)    │ │(CPU x2)   │
+└────────┘ └─────────┘ └───────────┘
 ```
 
 ### Services
 
 - **Application (FastAPI)**: REST API server handling requests
-- **worker-high (Celery)**: Dedicated to high-priority tasks (`/transcribe/`, `/keyboard/`, `/translate/`, `/align/`)
+- **worker-high (Celery)**: Dedicated to high-priority tasks (`/transcribe/`, `/keyboard/`, `/translate/`)
 - **worker-default (Celery)**: Dedicated to default tasks (`/transcribe_long_form/`, `/translate_long_form/`)
+- **worker-alignment (Celery)**: Dedicated CPU alignment worker (`/align/`, `/align_long_form/`) — 2 replicas so a long task doesn't block short requests
 - **Redis**: Message broker and result backend
 
 ### Task Queue & Priority System
@@ -881,26 +900,27 @@ The system uses **two-level prioritization**: dedicated queue workers + numeric 
 | `/keyboard/` | `high_priority` | 0 (urgent) | Always urgent, no priority parameter |
 | `/transcribe/` | `high_priority` | 0 (high) | Accepts `high` or `normal` |
 | `/translate/` | `high_priority` | 0 (high) | Welsh → English translation |
-| `/align/` | `high_priority` | 0 (urgent) | Align text to audio, word-level timestamps |
-| `/transcribe_long_form/` | `default` | 5 (normal) | Accepts `normal` or `low`. `high` is demoted to `normal` |
-| `/translate_long_form/` | `default` | 5 (normal) | Async translation. Accepts `normal` or `low` |
+| `/transcribe_long_form/` | `default` | 5 (normal) | Asynchronous, no priority parameter |
+| `/translate_long_form/` | `default` | 5 (normal) | Async translation, no priority parameter |
+| `/align/` | `alignment` | 0 (urgent) | Align text to audio, word-level timestamps (CPU) |
+| `/align_long_form/` | `alignment` | 5 (normal) | Async long audio alignment (CPU) |
 
 #### Worker Queue Assignment
 
 Workers are dedicated to specific queues via the `WORKER_QUEUES` environment variable:
 
-| Worker | Queues | Serves |
-|--------|--------|--------|
-| `worker-high` | `high_priority` | `/transcribe/`, `/keyboard/`, `/translate/`, `/align/` |
-| `worker-default` | `default` | `/transcribe_long_form/`, `/translate_long_form/` |
+| Worker | Queues | Device | Serves |
+|--------|--------|--------|--------|
+| `worker-high` | `high_priority` | GPU | `/transcribe/`, `/keyboard/`, `/translate/` |
+| `worker-default` | `default` | GPU | `/transcribe_long_form/`, `/translate_long_form/` |
+| `worker-alignment` (x2) | `alignment` | CPU | `/align/`, `/align_long_form/` |
 
 #### Numeric Priorities (within each queue)
 
 | Value | Name | Used By |
 |-------|------|---------|
 | 0 | urgent | `/keyboard/`, `/transcribe/` with `priority=high`, `/translate/`, `/align/` |
-| 5 | normal | `/transcribe/` with `priority=normal`, `/transcribe_long_form/`, `/translate_long_form/` |
-| 9 | low | `/transcribe_long_form/` with `priority=low`, `/translate_long_form/` with `priority=low` |
+| 5 | normal | `/transcribe/` with `priority=normal`, `/transcribe_long_form/`, `/translate_long_form/`, `/align_long_form/` |
 
 ---
 
@@ -1085,6 +1105,10 @@ services:
   worker-default:
     environment:
       - WORKER_QUEUES=default          # Only default tasks
+
+  worker-alignment:
+    environment:
+      - WORKER_QUEUES=alignment        # Alignment tasks only (CPU)
 ```
 
 To create a worker that handles both queues (useful for small deployments):
@@ -1179,7 +1203,7 @@ Then navigate to http://localhost:5511
 ### Tasks stuck in queue
 - Check worker status: `make status`
 - Inspect queue: `curl http://localhost:5511/queue/status/`
-- Restart workers: `docker compose -f docker-compose.gpu.yml restart worker-high worker-default`
+- Restart workers: `docker compose -f docker-compose.gpu.yml restart worker-high worker-default worker-alignment`
 
 ---
 
