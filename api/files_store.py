@@ -8,9 +8,11 @@ from pathlib import Path
 
 #
 UPLOAD_DIR = "/recordings"
+SHORT_FORM_DIR = "/recordings_short"
 
-def get_audio_file_path(stt_id):
-    return os.path.join(UPLOAD_DIR, stt_id)
+def get_audio_file_path(stt_id, short_form=False):
+    base_dir = SHORT_FORM_DIR if short_form else UPLOAD_DIR
+    return os.path.join(base_dir, stt_id)
 
 def get_file_path(stt_id, extension):
     return os.path.join(UPLOAD_DIR, stt_id + "." + extension)
@@ -22,8 +24,8 @@ def get_if_exists_file_path(stt_id, extension):
     return p
 
 
-async def save_sound_file(stt_id, soundfile):
-    audio_file_path = get_audio_file_path(stt_id)
+async def save_sound_file(stt_id, soundfile, short_form=False):
+    audio_file_path = get_audio_file_path(stt_id, short_form=short_form)
     try:
         # Stream file in chunks to avoid loading entire file into memory
         chunk_size = 1024 * 1024  # 1MB chunks

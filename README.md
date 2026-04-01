@@ -284,21 +284,34 @@ curl -X POST "http://localhost:5511/keyboard/" \
 │ high_priority    │  /transcribe/, /keyboard/, /translate/
 │ default          │  /transcribe_long_form/, /translate_long_form/
 │ alignment        │  /align/, /align_long_form/
-└──┬───┬───┬───────┘
-   │   │   │
-   ▼   ▼   ▼
-┌────────┐ ┌─────────┐ ┌───────────┐
-│worker  │ │worker   │ │worker     │  Yn Raddadwy'n
-│-high   │ │-default │ │-alignment │  Annibynnol
-│(GPU)   │ │(GPU)    │ │(CPU x2)   │
-└────────┘ └─────────┘ └───────────┘
+└──┬───┬───┬───┬───┘
+   │   │   │   │
+   ▼   ▼   ▼   ▼
+┌────────┐ ┌──────────┐ ┌─────────┐ ┌───────────┐
+│worker  │ │worker    │ │worker   │ │worker     │  Yn Raddadwy'n
+│-high   │ │-high-2   │ │-default │ │-alignment │  Annibynnol
+│GPU 1   │ │GPU 0     │ │GPU 1    │ │(CPU x2)   │
+│(GPU 1) │ │(GPU 0)   │ │(GPU 1)  │ │           │
+└────────┘ └──────────┘ └─────────┘ └───────────┘
 ```
+
+### Aseiniad GPU
+
+| Gwasanaeth | Ciw | GPU | Nodiadau |
+|------------|-----|-----|----------|
+| `worker-high` | `high_priority` | GPU 1 | Yn rhannu GPU gyda worker-default |
+| `worker-high-2` | `high_priority` | GPU 0 | GPU pwrpasol, gorlif blaenoriaeth uchel |
+| `worker-default` | `default` | GPU 1 | Yn rhannu GPU gyda worker-high |
+| `worker-alignment` (x2) | `alignment` | CPU | Alinio wav2vec2 ar CPU |
+
+Pan fo `worker-default` yn brysur gyda thrawsgrifiad hir, mae `worker-high-2` ar GPU 0 yn sicrhau bod ceisiadau blaenoriaeth uchel yn dal i gael eu gwasanaethu'n gyflym.
 
 ### Gwasanaethau
 
 - **Application (FastAPI)**: Gweinydd API REST yn trin ceisiadau
-- **worker-high (Celery)**: Pwrpasol ar gyfer tasgau blaenoriaeth uchel (`/transcribe/`, `/keyboard/`, `/translate/`)
-- **worker-default (Celery)**: Pwrpasol ar gyfer tasgau rhagosodedig (`/transcribe_long_form/`, `/translate_long_form/`)
+- **worker-high (Celery)**: Pwrpasol ar gyfer tasgau blaenoriaeth uchel (`/transcribe/`, `/keyboard/`, `/translate/`) — GPU 1
+- **worker-high-2 (Celery)**: Ail weithiwr blaenoriaeth uchel ar GPU pwrpasol (`/transcribe/`, `/keyboard/`, `/translate/`) — GPU 0
+- **worker-default (Celery)**: Pwrpasol ar gyfer tasgau rhagosodedig (`/transcribe_long_form/`, `/translate_long_form/`) — GPU 1
 - **worker-alignment (Celery)**: Pwrpasol ar gyfer alinio ar CPU (`/align/`, `/align_long_form/`) — 2 replica rhag ofn bod tasg hir yn rhwystro
 - **Redis**: Brocer negeseuon a storfa canlyniadau
 
@@ -324,8 +337,9 @@ Mae gweithwyr yn cael eu neilltuo i giwiau penodol trwy'r newidyn amgylchedd `WO
 
 | Gweithiwr | Ciwiau | Dyfais | Yn Gwasanaethu |
 |-----------|--------|--------|----------------|
-| `worker-high` | `high_priority` | GPU | `/transcribe/`, `/keyboard/`, `/translate/` |
-| `worker-default` | `default` | GPU | `/transcribe_long_form/`, `/translate_long_form/` |
+| `worker-high` | `high_priority` | GPU 1 | `/transcribe/`, `/keyboard/`, `/translate/` |
+| `worker-high-2` | `high_priority` | GPU 0 | `/transcribe/`, `/keyboard/`, `/translate/` |
+| `worker-default` | `default` | GPU 1 | `/transcribe_long_form/`, `/translate_long_form/` |
 | `worker-alignment` (x2) | `alignment` | CPU | `/align/`, `/align_long_form/` |
 
 #### Blaenoriaethau Rhifol (o fewn pob ciw)
@@ -492,17 +506,25 @@ make scale-high-gpu N=2
 make scale-default-gpu N=2
 ```
 
-### Terfynau Cof GPU
+### Ffurfweddiad Aml-GPU
 
-Mae pob gweithiwr angen ~6GB VRAM. Ar gyfer un RTX 3090 (24GB):
+Mae pob gweithiwr angen ~6GB VRAM. Mae'r ffurfweddiad rhagosodedig yn defnyddio dwy GPU:
 
-| Ffurfweddiad | Gweithwyr Uchel | Gweithwyr Rhagosodedig | Cyfanswm VRAM |
-|--------------|----------------|------------------------|----------------|
-| Isafswm | 1 | 1 | ~12GB |
-| Cytbwys | 2 | 2 | ~24GB (uchafswm) |
-| Amser real | 3 | 1 | ~24GB (uchafswm) |
+| GPU | Gweithwyr | VRAM a Ddefnyddir |
+|-----|-----------|-------------------|
+| GPU 1 | `worker-high` + `worker-default` | ~12GB |
+| GPU 0 | `worker-high-2` | ~6GB |
 
-Gweler [docs/GPU_SCALING.md](docs/GPU_SCALING.md) ar gyfer ffurfweddiadau aml-GPU.
+Mae hyn yn sicrhau bod ceisiadau blaenoriaeth uchel yn cael eu gwasanaethu'n gyflym hyd yn oed pan fo trawsgrifiad hir yn rhedeg ar GPU 1.
+
+Ffurfweddu'r aseiniad GPU yn `config.env`:
+```bash
+CUDA_DEVICE_INDEX_HIGH=1      # worker-high → GPU 1
+CUDA_DEVICE_INDEX_DEFAULT=1   # worker-default → GPU 1
+CUDA_DEVICE_INDEX_HIGH_2=0    # worker-high-2 → GPU 0
+```
+
+Gweler [docs/GPU_SCALING.md](docs/GPU_SCALING.md) am fwy o fanylion.
 
 ### Aseiniad Ciwiau Gweithwyr
 
@@ -513,11 +535,15 @@ Mae gweithwyr yn cael eu haseinio i giwiau trwy'r newidyn amgylchedd `WORKER_QUE
 services:
   worker-high:
     environment:
-      - WORKER_QUEUES=high_priority    # Tasgau blaenoriaeth uchel yn unig
+      - WORKER_QUEUES=high_priority    # Tasgau blaenoriaeth uchel (GPU 1)
+
+  worker-high-2:
+    environment:
+      - WORKER_QUEUES=high_priority    # Tasgau blaenoriaeth uchel (GPU 0)
 
   worker-default:
     environment:
-      - WORKER_QUEUES=default          # Tasgau rhagosodedig yn unig
+      - WORKER_QUEUES=default          # Tasgau rhagosodedig (GPU 1)
 
   worker-alignment:
     environment:
@@ -871,21 +897,34 @@ curl -X POST "http://localhost:5511/keyboard/" \
 │ high_priority    │  /transcribe/, /keyboard/, /translate/
 │ default          │  /transcribe_long_form/, /translate_long_form/
 │ alignment        │  /align/, /align_long_form/
-└──┬───┬───┬───────┘
-   │   │   │
-   ▼   ▼   ▼
-┌────────┐ ┌─────────┐ ┌───────────┐
-│worker  │ │worker   │ │worker     │  Independently
-│-high   │ │-default │ │-alignment │  Scalable
-│(GPU)   │ │(GPU)    │ │(CPU x2)   │
-└────────┘ └─────────┘ └───────────┘
+└──┬───┬───┬───┬───┘
+   │   │   │   │
+   ▼   ▼   ▼   ▼
+┌────────┐ ┌──────────┐ ┌─────────┐ ┌───────────┐
+│worker  │ │worker    │ │worker   │ │worker     │  Independently
+│-high   │ │-high-2   │ │-default │ │-alignment │  Scalable
+│GPU 1   │ │GPU 0     │ │GPU 1    │ │(CPU x2)   │
+│(GPU 1) │ │(GPU 0)   │ │(GPU 1)  │ │           │
+└────────┘ └──────────┘ └─────────┘ └───────────┘
 ```
+
+### GPU Assignment
+
+| Service | Queue | GPU | Notes |
+|---------|-------|-----|-------|
+| `worker-high` | `high_priority` | GPU 1 | Shares GPU with worker-default |
+| `worker-high-2` | `high_priority` | GPU 0 | Dedicated GPU, high-priority overflow |
+| `worker-default` | `default` | GPU 1 | Shares GPU with worker-high |
+| `worker-alignment` (x2) | `alignment` | CPU | wav2vec2 alignment on CPU |
+
+When `worker-default` is busy with a long-form transcription, `worker-high-2` on GPU 0 ensures high-priority requests are still served quickly.
 
 ### Services
 
 - **Application (FastAPI)**: REST API server handling requests
-- **worker-high (Celery)**: Dedicated to high-priority tasks (`/transcribe/`, `/keyboard/`, `/translate/`)
-- **worker-default (Celery)**: Dedicated to default tasks (`/transcribe_long_form/`, `/translate_long_form/`)
+- **worker-high (Celery)**: Dedicated to high-priority tasks (`/transcribe/`, `/keyboard/`, `/translate/`) — GPU 1
+- **worker-high-2 (Celery)**: Second high-priority worker on dedicated GPU (`/transcribe/`, `/keyboard/`, `/translate/`) — GPU 0
+- **worker-default (Celery)**: Dedicated to default tasks (`/transcribe_long_form/`, `/translate_long_form/`) — GPU 1
 - **worker-alignment (Celery)**: Dedicated CPU alignment worker (`/align/`, `/align_long_form/`) — 2 replicas so a long task doesn't block short requests
 - **Redis**: Message broker and result backend
 
@@ -911,8 +950,9 @@ Workers are dedicated to specific queues via the `WORKER_QUEUES` environment var
 
 | Worker | Queues | Device | Serves |
 |--------|--------|--------|--------|
-| `worker-high` | `high_priority` | GPU | `/transcribe/`, `/keyboard/`, `/translate/` |
-| `worker-default` | `default` | GPU | `/transcribe_long_form/`, `/translate_long_form/` |
+| `worker-high` | `high_priority` | GPU 1 | `/transcribe/`, `/keyboard/`, `/translate/` |
+| `worker-high-2` | `high_priority` | GPU 0 | `/transcribe/`, `/keyboard/`, `/translate/` |
+| `worker-default` | `default` | GPU 1 | `/transcribe_long_form/`, `/translate_long_form/` |
 | `worker-alignment` (x2) | `alignment` | CPU | `/align/`, `/align_long_form/` |
 
 #### Numeric Priorities (within each queue)
@@ -1079,17 +1119,25 @@ make scale-high-gpu N=2
 make scale-default-gpu N=2
 ```
 
-### GPU Memory Limits
+### Multi-GPU Configuration
 
-Each worker needs ~6GB VRAM. For a single RTX 3090 (24GB):
+Each worker needs ~6GB VRAM. The default configuration uses two GPUs:
 
-| Configuration | High Workers | Default Workers | Total VRAM |
-|---------------|-------------|-----------------|------------|
-| Minimal | 1 | 1 | ~12GB |
-| Balanced | 2 | 2 | ~24GB (max) |
-| Real-time focused | 3 | 1 | ~24GB (max) |
+| GPU | Workers | VRAM Used |
+|-----|---------|-----------|
+| GPU 1 | `worker-high` + `worker-default` | ~12GB |
+| GPU 0 | `worker-high-2` | ~6GB |
 
-See [docs/GPU_SCALING.md](docs/GPU_SCALING.md) for multi-GPU configurations.
+This ensures high-priority requests are served quickly even when a long-form transcription is running on GPU 1.
+
+Configure GPU assignment in `config.env`:
+```bash
+CUDA_DEVICE_INDEX_HIGH=1      # worker-high → GPU 1
+CUDA_DEVICE_INDEX_DEFAULT=1   # worker-default → GPU 1
+CUDA_DEVICE_INDEX_HIGH_2=0    # worker-high-2 → GPU 0
+```
+
+See [docs/GPU_SCALING.md](docs/GPU_SCALING.md) for more details.
 
 ### Worker Queue Assignment
 
@@ -1100,11 +1148,15 @@ Workers are assigned to queues via the `WORKER_QUEUES` environment variable in d
 services:
   worker-high:
     environment:
-      - WORKER_QUEUES=high_priority    # Only high-priority tasks
+      - WORKER_QUEUES=high_priority    # High-priority tasks (GPU 1)
+
+  worker-high-2:
+    environment:
+      - WORKER_QUEUES=high_priority    # High-priority tasks (GPU 0)
 
   worker-default:
     environment:
-      - WORKER_QUEUES=default          # Only default tasks
+      - WORKER_QUEUES=default          # Default tasks (GPU 1)
 
   worker-alignment:
     environment:

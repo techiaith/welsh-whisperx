@@ -25,8 +25,9 @@ async def get_queue_status(celery: Celery) -> dict:
         # Get reserved tasks (claimed by worker but not started yet)
         reserved_tasks = inspect.reserved()
 
-        # Get worker stats
+        # Get worker stats and queue assignments
         stats = inspect.stats()
+        active_queues = inspect.active_queues() or {}
 
         # Process active tasks to extract useful info
         active_summary = []
@@ -65,8 +66,10 @@ async def get_queue_status(celery: Celery) -> dict:
         workers_info = []
         if stats:
             for worker_name, worker_stats in stats.items():
+                queues = [q.get('name') for q in active_queues.get(worker_name, [])]
                 workers_info.append({
                     'name': worker_name,
+                    'queues': queues,
                     'pool': worker_stats.get('pool', {}).get('implementation'),
                     'max_concurrency': worker_stats.get('pool', {}).get('max-concurrency'),
                     'total_tasks_executed': worker_stats.get('total', {})

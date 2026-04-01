@@ -18,12 +18,13 @@ services:
        - "5511:8000"
      volumes:
        - ${PWD}/recordings:/recordings
+       - short_form_audio:/recordings_short
      depends_on:
        - redis
 
 
   # High-priority worker: /transcribe/ and /keyboard/ requests
-  # Scale with: docker compose -f docker-compose.gpu.yml up -d --scale worker-high=N
+  # Runs on GPU 1 — shares GPU with worker-default
   worker-high:
     image: techiaith/whisperx-worker
     deploy:
@@ -31,7 +32,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['${CUDA_DEVICE_INDEX:-0}']
+              device_ids: ['${CUDA_DEVICE_INDEX_HIGH:-1}']
               capabilities: [gpu]
     restart: always
     environment:
@@ -54,11 +55,43 @@ services:
         DEVICE: gpu
     volumes:
        - ${PWD}/recordings:/recordings
+       - short_form_audio:/recordings_short
+    depends_on:
+       - redis
+
+  # Second high-priority worker on GPU 0 — dedicated GPU.
+  # Handles overflow high-priority requests while GPU 1 is busy with long-form.
+  worker-high-2:
+    image: techiaith/whisperx-worker
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['${CUDA_DEVICE_INDEX_HIGH_2:-0}']
+              capabilities: [gpu]
+    restart: always
+    environment:
+      - WORKER_QUEUES=high_priority
+      - WHISPER_MODEL_NAME=${WHISPER_MODEL_NAME}
+      - WHISPER_MODEL_DEVICE=gpu
+      - WHISPER_MODEL_LANGUAGE=${WHISPER_MODEL_LANGUAGE}
+      - WAV2VEC2_MODEL=${WAV2VEC2_MODEL}
+      - HF_AUTH_TOKEN=${HF_AUTH_TOKEN}
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - TORCH_FORCE_WEIGHTS_ONLY_LOAD=0
+      - DIARIZE_MIN_DURATION_SECONDS=${DIARIZE_MIN_DURATION_SECONDS:-30}
+      - SAVE_FILES_MIN_DURATION_SECONDS=${SAVE_FILES_MIN_DURATION_SECONDS:-30}
+      - ALIGN_MIN_DURATION_SECONDS=${ALIGN_MIN_DURATION_SECONDS:-30}
+    volumes:
+       - ${PWD}/recordings:/recordings
+       - short_form_audio:/recordings_short
     depends_on:
        - redis
 
   # Default worker: /transcribe_long_form/ requests (normal and low priority)
-  # Scale with: docker compose -f docker-compose.gpu.yml up -d --scale worker-default=N
+  # Runs on GPU 1 — shares GPU with worker-high
   # No build: section — uses the image built by worker-high
   worker-default:
     image: techiaith/whisperx-worker
@@ -67,7 +100,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['${CUDA_DEVICE_INDEX:-0}']
+              device_ids: ['${CUDA_DEVICE_INDEX_DEFAULT:-1}']
               capabilities: [gpu]
     restart: always
     environment:
@@ -111,6 +144,7 @@ services:
       - TORCH_FORCE_WEIGHTS_ONLY_LOAD=0
     volumes:
        - ${PWD}/recordings:/recordings
+       - short_form_audio:/recordings_short
     depends_on:
        - redis
 
@@ -125,3 +159,9 @@ services:
 
 volumes:
     redis_data: {}
+    short_form_audio:
+      driver: local
+      driver_opts:
+        type: tmpfs
+        device: tmpfs
+        o: size=256m

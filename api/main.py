@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 import json
@@ -81,6 +82,57 @@ app.add_middleware(
 )
 
 celery = Celery('tasks', broker=BROKER_CONN_URI, backend=BACKEND_CONN_URI)
+
+
+def localhost_only(request: Request):
+    """Block requests that arrived via a reverse proxy (X-Forwarded-For present).
+    Direct local requests (curl from the host, Docker network) don't have this header."""
+    if request.headers.get('x-forwarded-for'):
+        raise HTTPException(status_code=403, detail="This endpoint is only accessible locally")
+
+# In-flight task tracking via Redis atomic counters.
+# Uses a dedicated Redis connection (thread-safe pool) separate from task_store
+# to avoid protocol corruption when multiple threads access Redis concurrently.
+import redis as _redis
+_inflight_redis = _redis.Redis(
+    host=REDIS_HOST,
+    port=int(REDIS_PORT),
+    db=0,
+    decode_responses=True,
+    max_connections=20
+)
+
+def send_task_tracked(task_name, args=None, kwargs=None, queue='high_priority', priority=5):
+    """Send a Celery task and increment the in-flight counter for its queue."""
+    _inflight_redis.incr(f'queue:inflight:{queue}')
+    return celery.send_task(task_name, args=args, kwargs=kwargs, queue=queue, priority=priority)
+
+def decr_inflight(queue):
+    """Decrement the in-flight counter (call after task completes or fails)."""
+    val = _inflight_redis.decr(f'queue:inflight:{queue}')
+    # Prevent going negative from restarts or race conditions
+    if val < 0:
+        _inflight_redis.set(f'queue:inflight:{queue}', 0)
+
+async def await_task(celery_task, timeout=60.0):
+    """Wait for a Celery task result without blocking the asyncio event loop.
+    Polls the result backend directly instead of using Celery's .get(),
+    which uses a shared pubsub connection that isn't safe across threads."""
+    import time
+    deadline = time.monotonic() + timeout
+    poll_interval = 0.05  # Start at 50ms
+
+    while time.monotonic() < deadline:
+        if celery_task.ready():
+            result = celery_task.result
+            if celery_task.failed():
+                raise celery_task.result  # Re-raise the exception
+            return result
+        await asyncio.sleep(poll_interval)
+        # Back off gradually: 50ms → 100ms → 200ms, cap at 200ms
+        poll_interval = min(poll_interval * 2, 0.2)
+
+    raise TimeoutError(f"Task {celery_task.id} did not complete within {timeout}s")
 
 # Configure Celery with both named queues AND numeric priorities
 #
@@ -166,11 +218,11 @@ async def transcribe(
     Transcribe short audio synchronously. Max file size: 480KB.
     Returns the result directly in the response as JSON data."""
     stt_id = str(uuid.uuid4())
-    logger = get_logger(stt_id)
+    logger = get_logger(stt_id, log_to_file=False)
     logger.info(f"[API] New transcription request - endpoint: /transcribe/, stt_id: {stt_id}, priority: {priority}")
 
     #
-    audio_file_path, audio_file_size = await save_sound_file(stt_id, soundfile)
+    audio_file_path, audio_file_size = await save_sound_file(stt_id, soundfile, short_form=True)
     logger.info(f"[API] Audio file saved: {audio_file_path}, size: {audio_file_size} bytes")
 
     #
@@ -180,13 +232,17 @@ async def transcribe(
         task_priority = 0 if priority == 'high' else 5
 
         logger.info(f"[API] Sending task to queue 'high_priority' with priority {task_priority} ({priority}) for processing")
-        transcription_task = celery.send_task(
+        transcription_task = send_task_tracked(
             'speech_to_text',
             args=(audio_file_path, 'transcribe'),
+            kwargs={'short_form': True},
             queue='high_priority',
             priority=task_priority
         )
-        task_result = transcription_task.get(timeout=60.0)
+        try:
+            task_result = await await_task(transcription_task)
+        finally:
+            decr_inflight('high_priority')
         result = task_result
         logger.info(f"[API] Transcription completed successfully")
     else:
@@ -211,23 +267,27 @@ async def transcribe_for_keyboard(
     Transcribe for keyboard input — returns a plain text.
     High priority, max file size: 480KB."""
     stt_id = str(uuid.uuid4())
-    logger = get_logger(stt_id)
+    logger = get_logger(stt_id, log_to_file=False)
     logger.info(f"[API] New transcription request - endpoint: /keyboard/, stt_id: {stt_id}")
 
-    audio_file_path, audio_file_size = await save_sound_file(stt_id, audio_file)
+    audio_file_path, audio_file_size = await save_sound_file(stt_id, audio_file, short_form=True)
     logger.info(f"[API] Audio file saved: {audio_file_path}, size: {audio_file_size} bytes")
 
     if audio_file_size < 480000:
         # /keyboard/ always routes to high_priority queue with urgent priority
         # (real-time use case - user is typing and waiting)
         logger.info(f"[API] Sending task to queue 'high_priority' with priority 0 (high) for processing")
-        transcription_task = celery.send_task(
+        transcription_task = send_task_tracked(
             'speech_to_text',
             args=(audio_file_path, 'transcribe'),
+            kwargs={'short_form': True},
             queue='high_priority',
             priority=0
         )
-        task_result = transcription_task.get(timeout=60.0)
+        try:
+            task_result = await await_task(transcription_task)
+        finally:
+            decr_inflight('high_priority')
 
         # Extract text directly from task result (no file dependency)
         text = ''
@@ -286,23 +346,27 @@ async def translate(
 
     Translate short Welsh audio to English text synchronously. Max file size: 480KB."""
     stt_id = str(uuid.uuid4())
-    logger = get_logger(stt_id)
+    logger = get_logger(stt_id, log_to_file=False)
     logger.info(f"[API] New translation request - endpoint: /translate/, stt_id: {stt_id}, priority: {priority}")
 
-    audio_file_path, audio_file_size = await save_sound_file(stt_id, soundfile)
+    audio_file_path, audio_file_size = await save_sound_file(stt_id, soundfile, short_form=True)
     logger.info(f"[API] Audio file saved: {audio_file_path}, size: {audio_file_size} bytes")
 
     if audio_file_size < 480000:
         task_priority = 0 if priority == 'high' else 5
 
         logger.info(f"[API] Sending translate task to queue 'high_priority' with priority {task_priority} ({priority})")
-        translation_task = celery.send_task(
+        translation_task = send_task_tracked(
             'speech_to_text',
             args=(audio_file_path, 'translate'),
+            kwargs={'short_form': True},
             queue='high_priority',
             priority=task_priority
         )
-        task_result = translation_task.get(timeout=60.0)
+        try:
+            task_result = await await_task(translation_task)
+        finally:
+            decr_inflight('high_priority')
         result = task_result
         logger.info(f"[API] Translation completed successfully")
     else:
@@ -363,21 +427,24 @@ async def align_audio_endpoint(
     Returns word-level and character-level timestamps with confidence scores.
     Max file size: 480KB. No transcription — alignment only."""
     stt_id = str(uuid.uuid4())
-    logger = get_logger(stt_id)
+    logger = get_logger(stt_id, log_to_file=False)
     logger.info(f"[API] New alignment request - endpoint: /align/, stt_id: {stt_id}, text length: {len(text)} chars")
 
-    audio_file_path, audio_file_size = await save_sound_file(stt_id, soundfile)
+    audio_file_path, audio_file_size = await save_sound_file(stt_id, soundfile, short_form=True)
     logger.info(f"[API] Audio file saved: {audio_file_path}, size: {audio_file_size} bytes")
 
     if audio_file_size < 480000:
         logger.info(f"[API] Sending align task to queue 'alignment' with priority 0 (urgent)")
-        align_task = celery.send_task(
+        align_task = send_task_tracked(
             'align_audio',
             args=(audio_file_path, text),
             queue='alignment',
             priority=0
         )
-        task_result = align_task.get(timeout=60.0)
+        try:
+            task_result = await await_task(align_task)
+        finally:
+            decr_inflight('alignment')
         result = task_result
         logger.info(f"[API] Alignment completed successfully")
     else:
@@ -553,7 +620,7 @@ async def delete(stt_id: str = Depends(validate_stt_id)):
     return response
 
 
-@app.get('/health/', include_in_schema=False)
+@app.get('/health/', include_in_schema=False, dependencies=[Depends(localhost_only)])
 async def health():
     """Gwiriad iechyd cynhwysfawr — Redis, gweithwyr Celery, a statws modelau.
 
@@ -561,7 +628,7 @@ async def health():
     return await get_comprehensive_health(celery)
 
 
-@app.get('/health/ready/', include_in_schema=False)
+@app.get('/health/ready/', include_in_schema=False, dependencies=[Depends(localhost_only)])
 async def readiness():
     """Prawf parodrwydd ar gyfer llwyth-gydbwysyddion. 200 os yn barod, 503 fel arall.
 
@@ -575,7 +642,7 @@ async def readiness():
         )
 
 
-@app.get('/health/live/', include_in_schema=False)
+@app.get('/health/live/', include_in_schema=False, dependencies=[Depends(localhost_only)])
 async def liveness():
     """Prawf bywiogrwydd — 200 os yw'r broses API yn fyw ac yn ymateb.
 
@@ -583,7 +650,7 @@ async def liveness():
     return await check_liveness()
 
 
-@app.get('/queue/status/', include_in_schema=False)
+@app.get('/queue/status/', include_in_schema=False, dependencies=[Depends(localhost_only)])
 async def queue_status():
     """Archwilio statws ciwiau Celery — tasgau gweithredol, wedi'u trefnu a chadw.
 
@@ -591,7 +658,32 @@ async def queue_status():
     return await get_queue_status(celery)
 
 
-@app.post('/cleanup/run/', include_in_schema=False)
+@app.get('/queue/depth/', include_in_schema=False, dependencies=[Depends(localhost_only)])
+async def queue_depth():
+    """Cyfrif tasgau mewn hedfan yn ôl ciw (wedi'u danfon ond heb eu cwblhau).
+
+    Count in-flight tasks per queue (dispatched but not yet completed).
+    Uses atomic Redis counters incremented on dispatch, decremented on completion."""
+    try:
+        queues = ['high_priority', 'default', 'alignment']
+        counts = {}
+        total = 0
+        for q in queues:
+            val = _inflight_redis.get(f'queue:inflight:{q}')
+            count = int(val) if val else 0
+            counts[q] = count
+            total += count
+        return {
+            'version': 2,
+            'queues': counts,
+            'total_in_flight': total,
+            'timestamp': __import__('time').time()
+        }
+    except Exception as e:
+        return {'version': 2, 'error': str(e)}
+
+
+@app.post('/cleanup/run/', include_in_schema=False, dependencies=[Depends(localhost_only)])
 async def cleanup_run():
     """Sbarduno glanhau ffeiliau hen â llaw.
 
@@ -599,7 +691,7 @@ async def cleanup_run():
     return await run_cleanup_now()
 
 
-@app.get('/cleanup/status/', include_in_schema=False)
+@app.get('/cleanup/status/', include_in_schema=False, dependencies=[Depends(localhost_only)])
 async def cleanup_status(request: Request):
     """Statws a chyfluniad y trefnydd glanhau.
 

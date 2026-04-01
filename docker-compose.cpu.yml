@@ -18,6 +18,7 @@ services:
        - "5511:8000"
      volumes:
        - ${PWD}/recordings:/recordings
+       - short_form_audio:/recordings_short
      depends_on:
        - redis
 
@@ -43,6 +44,7 @@ services:
         DEVICE: cpu
     volumes:
        - ${PWD}/recordings:/recordings
+       - short_form_audio:/recordings_short
     depends_on:
        - redis
 
@@ -86,6 +88,7 @@ services:
       - TORCH_FORCE_WEIGHTS_ONLY_LOAD=0
     volumes:
        - ${PWD}/recordings:/recordings
+       - short_form_audio:/recordings_short
     depends_on:
        - redis
 
@@ -100,3 +103,9 @@ services:
 
 volumes:
     redis_data: {}
+    short_form_audio:
+      driver: local
+      driver_opts:
+        type: tmpfs
+        device: tmpfs
+        o: size=256m

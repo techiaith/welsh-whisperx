@@ -55,6 +55,38 @@ async def get_comprehensive_health(celery: Celery) -> dict:
     except Exception as e:
         health_status['checks']['models'] = f'error: {str(e)}'
 
+    # Check GPU status for each worker
+    try:
+        import json
+        device_keys = list(task_store.redis_client.scan_iter(match='worker:device:*'))
+        gpu_workers = []
+        degraded_workers = []
+        for key in device_keys:
+            key_str = key if isinstance(key, str) else key.decode()
+            hostname = key_str.split('worker:device:')[1]
+            raw = task_store.redis_client.get(key)
+            if raw:
+                info = json.loads(raw)
+                if info.get('degraded'):
+                    degraded_workers.append(hostname)
+                elif info.get('device') == 'cuda':
+                    gpu_workers.append(hostname)
+
+        health_status['checks']['gpu'] = {
+            'gpu_workers': len(gpu_workers),
+            'degraded_workers': len(degraded_workers),
+        }
+
+        if degraded_workers:
+            health_status['checks']['gpu']['degraded_hostnames'] = degraded_workers
+            health_status['checks']['gpu']['warning'] = (
+                'GPU workers running on CPU! NVIDIA driver may have crashed. '
+                'Restart affected workers: docker compose restart worker-high worker-default'
+            )
+            health_status['status'] = 'degraded'
+    except Exception as e:
+        health_status['checks']['gpu'] = f'error: {str(e)}'
+
     return health_status
 
 
