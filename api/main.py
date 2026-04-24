@@ -179,11 +179,28 @@ async def get_status(stt_id: str = Depends(validate_stt_id)):
     Also returns worker logs for the task."""
     # Retrieve task_id from Redis - survives server restarts
     task_status = "UNKNOWN"
+    task_error = None
     task_id = task_store.get_task_id(stt_id)
     if task_id:
         task_result = AsyncResult(task_id)
         task_status = task_result.status
-    
+        if task_status == "FAILURE" and task_result.result is not None:
+            task_error = str(task_result.result)
+        elif task_status == "STARTED" and isinstance(task_result.info, dict):
+            # Detect stalled tasks: worker claimed the task but has since died
+            worker_hostname = task_result.info.get('hostname', '')
+            if worker_hostname:
+                # Strip celery@ prefix to match heartbeat key format
+                hostname = worker_hostname.replace('celery@', '')
+                heartbeat = task_store.redis_client.get(f'worker:ready:{hostname}')
+                if heartbeat is None:
+                    task_status = "FAILURE"
+                    task_error = (
+                        f"Worker {hostname} is no longer responding. "
+                        f"The task likely failed due to the worker crashing (e.g. GPU out of memory). "
+                        f"Please resubmit the job."
+                    )
+
     # Read the log file if it exists
     log_content = []
     log_file_path = os.path.join(UPLOAD_DIR, f"{stt_id}.log")
@@ -196,14 +213,14 @@ async def get_status(stt_id: str = Depends(validate_stt_id)):
         except Exception as e:
             log_content = [f"Error reading log file: {str(e)}"]
 
-    #
     result = {
         'version': 2,
         'status': task_status,
         'log': log_content
     }
+    if task_error:
+        result['error'] = task_error
 
-    #
     return result
 
 
@@ -241,10 +258,28 @@ async def transcribe(
         )
         try:
             task_result = await await_task(transcription_task)
-        finally:
+            result = task_result
+            logger.info(f"[API] Transcription completed successfully")
+        except TimeoutError:
             decr_inflight('high_priority')
-        result = task_result
-        logger.info(f"[API] Transcription completed successfully")
+            logger.error(f"[API] Transcription task timed out for stt_id: {stt_id}")
+            return {
+                'id': stt_id,
+                'version': 2,
+                'success': False,
+                'message': "Transcription task timed out. The audio may be too long for synchronous processing — try /transcribe_long_form/ instead."
+            }
+        except Exception as e:
+            decr_inflight('high_priority')
+            logger.error(f"[API] Transcription task failed for stt_id: {stt_id}: {e}")
+            return {
+                'id': stt_id,
+                'version': 2,
+                'success': False,
+                'message': f"Transcription failed: {str(e)}"
+            }
+        else:
+            decr_inflight('high_priority')
     else:
         logger.warning(f"[API] Audio file too large ({audio_file_size} bytes)")
         result = {
@@ -286,7 +321,15 @@ async def transcribe_for_keyboard(
         )
         try:
             task_result = await await_task(transcription_task)
-        finally:
+        except TimeoutError:
+            decr_inflight('high_priority')
+            logger.error(f"[API] Keyboard transcription timed out for stt_id: {stt_id}")
+            return ""
+        except Exception as e:
+            decr_inflight('high_priority')
+            logger.error(f"[API] Keyboard transcription failed for stt_id: {stt_id}: {e}")
+            return ""
+        else:
             decr_inflight('high_priority')
 
         # Extract text directly from task result (no file dependency)
@@ -365,10 +408,28 @@ async def translate(
         )
         try:
             task_result = await await_task(translation_task)
-        finally:
+            result = task_result
+            logger.info(f"[API] Translation completed successfully")
+        except TimeoutError:
             decr_inflight('high_priority')
-        result = task_result
-        logger.info(f"[API] Translation completed successfully")
+            logger.error(f"[API] Translation task timed out for stt_id: {stt_id}")
+            return {
+                'id': stt_id,
+                'version': 2,
+                'success': False,
+                'message': "Translation task timed out. The audio may be too long for synchronous processing — try /translate_long_form/ instead."
+            }
+        except Exception as e:
+            decr_inflight('high_priority')
+            logger.error(f"[API] Translation task failed for stt_id: {stt_id}: {e}")
+            return {
+                'id': stt_id,
+                'version': 2,
+                'success': False,
+                'message': f"Translation failed: {str(e)}"
+            }
+        else:
+            decr_inflight('high_priority')
     else:
         logger.warning(f"[API] Audio file too large ({audio_file_size} bytes)")
         result = {
@@ -427,10 +488,10 @@ async def align_audio_endpoint(
     Returns word-level and character-level timestamps with confidence scores.
     Max file size: 480KB. No transcription — alignment only."""
     stt_id = str(uuid.uuid4())
-    logger = get_logger(stt_id, log_to_file=False)
+    logger = get_logger(stt_id)
     logger.info(f"[API] New alignment request - endpoint: /align/, stt_id: {stt_id}, text length: {len(text)} chars")
 
-    audio_file_path, audio_file_size = await save_sound_file(stt_id, soundfile, short_form=True)
+    audio_file_path, audio_file_size = await save_sound_file(stt_id, soundfile)
     logger.info(f"[API] Audio file saved: {audio_file_path}, size: {audio_file_size} bytes")
 
     if audio_file_size < 480000:
@@ -443,10 +504,28 @@ async def align_audio_endpoint(
         )
         try:
             task_result = await await_task(align_task)
-        finally:
+            result = task_result
+            logger.info(f"[API] Alignment completed successfully")
+        except TimeoutError:
             decr_inflight('alignment')
-        result = task_result
-        logger.info(f"[API] Alignment completed successfully")
+            logger.error(f"[API] Alignment task timed out for stt_id: {stt_id}")
+            return {
+                'id': stt_id,
+                'version': 2,
+                'success': False,
+                'message': "Alignment task timed out. The audio may be too long for synchronous processing — try /align_long_form/ instead."
+            }
+        except Exception as e:
+            decr_inflight('alignment')
+            logger.error(f"[API] Alignment task failed for stt_id: {stt_id}: {e}")
+            return {
+                'id': stt_id,
+                'version': 2,
+                'success': False,
+                'message': f"Alignment failed: {str(e)}"
+            }
+        else:
+            decr_inflight('alignment')
     else:
         logger.warning(f"[API] Audio file too large ({audio_file_size} bytes)")
         result = {

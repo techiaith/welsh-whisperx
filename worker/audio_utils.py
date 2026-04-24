@@ -38,7 +38,7 @@ def prepare_audio(audio_file_path):
             return wav_file_path.as_posix(), True
         return audio_file_path.as_posix(), True
 
-    logger.info(f"Converting audio to 16kHz mono PCM WAV with loudness normalization: {audio_file_path}")
+    logger.info(f"Converting audio to 16kHz mono PCM WAV: {audio_file_path}")
     # After conversion the output is guaranteed to be compatible PCM WAV
     return _convert_and_normalize(audio_file_path, wav_file_path), True
 
@@ -86,18 +86,23 @@ def _is_compatible(audio_file_path):
 
 def _convert_and_normalize(audio_file_path, wav_file_path):
     """
-    Single-pass ffmpeg: decode, resample to 16kHz mono, loudness-normalize, encode as PCM WAV.
+    ffmpeg: decode any input format, resample to 16kHz mono, encode as PCM WAV.
+
+    Note: loudnorm was removed because it requires a full-file analysis pass
+    which caused ffmpeg to timeout (>120s) on long audio files submitted via
+    /transcribe_long_form/ and /translate_long_form/. Whisper models are robust
+    to varying volume levels so loudness normalization is unnecessary.
     """
     convert_cmd = (
         f"ffmpeg -y -i {shlex.quote(str(audio_file_path))} "
-        f"-vn -af loudnorm "
+        f"-vn "
         f"-acodec {TARGET_CODEC} -ar {TARGET_SR} -ac {TARGET_CHANNELS} "
         f"{shlex.quote(str(wav_file_path))}"
     )
 
     result = subprocess.run(
         shlex.split(convert_cmd),
-        capture_output=True, timeout=120
+        capture_output=True, timeout=300
     )
 
     if result.returncode != 0:

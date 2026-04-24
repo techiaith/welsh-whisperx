@@ -1,7 +1,10 @@
+import builtins
 import hashlib
+import io
 import os
 import gc
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +22,22 @@ from lingua import Language
 # Add shared directory to path for logger
 sys.path.append('/app/shared')
 from stt_logger import get_logger
+
+@contextmanager
+def _redirect_print_to_logger(logger):
+    """Capture print() calls (e.g. WhisperX progress) and route them to the task logger."""
+    original_print = builtins.print
+    def _print_to_log(*args, **kwargs):
+        msg = ' '.join(str(a) for a in args)
+        if msg.strip():
+            logger.info(f"[WORKER] {msg.strip()}")
+        original_print(*args, **kwargs)
+    builtins.print = _print_to_log
+    try:
+        yield
+    finally:
+        builtins.print = original_print
+
 
 from audio_utils import prepare_audio, load_audio_fast
 from persist import save_as_json, save_as_text, save_as_elan, save_as_srt, save_as_vtt, save_as_speakers
@@ -144,39 +163,6 @@ def speech_to_text(self, audio_file_path, task='transcribe', short_form=False):
     # Pre-task GPU health check — detect and recover from GPU degradation
     self.ensure_gpu_healthy()
 
-    # Initialize Welsh normalizer
-    welsh_normalizer = WelshNormalizer()
-
-    def generate_md5_hex(audio_segment):
-        """Generate MD5 hash from audio segment data efficiently."""
-        # Convert numpy array slice to bytes efficiently
-        return hashlib.md5(audio_segment.tobytes()).hexdigest()
-
-    def whisperx_transcribe(audio, lang='', task='transcribe', skip_alignment=False):
-        # transcribe or translate
-        whisper_result = self.model.transcribe(audio, batch_size=2, language=lang, task=task)
-
-        if task == 'translate':
-            # Skip alignment — Welsh wav2vec2 can't align English text
-            return whisper_result
-
-        if skip_alignment:
-            # Skip alignment for short audio (voice assistant optimization)
-            return whisper_result
-
-        if type(self)._align_model is None:
-            # Alignment model not loaded on this worker (e.g. high_priority worker)
-            logger.info(f"[WORKER] Alignment model not loaded — skipping alignment")
-            return whisper_result
-
-        # align
-        return whisperx.align(whisper_result["segments"],
-                              self.align_model,
-                              self.align_metadata,
-                              audio,
-                              self.device,
-                              return_char_alignments='words')  # False)
-
     #
     print("Task speech to text for %s received" % audio_file_path)
 
@@ -186,6 +172,40 @@ def speech_to_text(self, audio_file_path, task='transcribe', short_form=False):
     logger.info(f"[WORKER] Speech-to-text task received for {audio_file_path}, task mode: {task}")
     _refresh_worker_heartbeat()
     logger.info(f"[WORKER] Running on device: {self.device} (requested: {type(self)._requested_device})")
+
+    try:
+        return _speech_to_text_inner(self, audio_file_path, audio_id, task, short_form, sampling_rate, logger)
+    except Exception as e:
+        logger.error(f"[WORKER] Task failed with exception: {type(e).__name__}: {e}")
+        raise
+
+
+def _speech_to_text_inner(self, audio_file_path, audio_id, task, short_form, sampling_rate, logger):
+    welsh_normalizer = WelshNormalizer()
+
+    def generate_md5_hex(audio_segment):
+        """Generate MD5 hash from audio segment data efficiently."""
+        return hashlib.md5(audio_segment.tobytes()).hexdigest()
+
+    def whisperx_transcribe(audio, lang='', task='transcribe', skip_alignment=False):
+        with _redirect_print_to_logger(logger):
+            whisper_result = self.model.transcribe(
+                audio, batch_size=2, language=lang, task=task,
+                print_progress=not short_form,
+            )
+        if task == 'translate':
+            return whisper_result
+        if skip_alignment:
+            return whisper_result
+        if type(self)._align_model is None:
+            logger.info(f"[WORKER] Alignment model not loaded — skipping alignment")
+            return whisper_result
+        return whisperx.align(whisper_result["segments"],
+                              self.align_model,
+                              self.align_metadata,
+                              audio,
+                              self.device,
+                              return_char_alignments='words')
 
     wav_audio_file_path, audio_is_pcm = prepare_audio(audio_file_path)
     logger.info(f"[WORKER] Audio prepared: {wav_audio_file_path} (pcm_compatible={audio_is_pcm})")
@@ -441,6 +461,14 @@ def align_audio(self, audio_file_path, text):
     _refresh_worker_heartbeat()
     logger.info(f"[WORKER] Running on device: {self.device} (requested: {type(self)._requested_device})")
 
+    try:
+        return _align_audio_inner(self, audio_file_path, audio_id, text, sampling_rate, logger)
+    except Exception as e:
+        logger.error(f"[WORKER] Alignment task failed with exception: {type(e).__name__}: {e}")
+        raise
+
+
+def _align_audio_inner(self, audio_file_path, audio_id, text, sampling_rate, logger):
     wav_audio_file_path, audio_is_pcm = prepare_audio(audio_file_path)
     logger.info(f"[WORKER] Audio prepared: {wav_audio_file_path} (pcm_compatible={audio_is_pcm})")
 
@@ -452,6 +480,27 @@ def align_audio(self, audio_file_path, text):
         audio = whisperx.load_audio(wav_audio_file_path, sr=sampling_rate)
     duration = len(audio) / float(sampling_rate)
     logger.info(f"[WORKER] Audio loaded, duration: {duration:.2f}s")
+
+    # Reject audio too short for wav2vec2 alignment (causes crashes under ~0.1s)
+    min_duration = 0.1
+    if duration < min_duration:
+        logger.warning(
+            f"[WORKER] Rejecting alignment: audio too short ({duration:.3f}s). "
+            f"Minimum duration: {min_duration}s"
+        )
+        del audio
+        gc.collect()
+        error_result = {
+            'id': audio_id,
+            'version': 2,
+            'success': False,
+            'message': (
+                f"Audio too short for alignment: {duration:.3f}s. "
+                f"Minimum duration: {min_duration}s."
+            )
+        }
+        save_as_json(wav_audio_file_path, error_result, logger)
+        return error_result
 
     # Validate text-to-audio ratio to reject absurd jobs
     # (e.g. 3 words for 20 minutes of audio will hang the worker)
