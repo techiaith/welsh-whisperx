@@ -1,5 +1,7 @@
 FROM python:3.11-slim
 
+ENV TZ=Europe/London
+
 RUN mkdir -p /var/log/api
 
 WORKDIR /api

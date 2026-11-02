@@ -75,6 +75,8 @@ FastAPI (port 5511) → Redis broker (port 6379) → Celery workers
 | `api/task_store.py` | Redis-backed mapping of `stt_id` (UUID) → Celery `task_id` (survives restarts) |
 | `api/health.py` | `/health/`, `/health/ready/`, `/health/live/` logic |
 | `api/cleanup_scheduler.py` | APScheduler cron job to delete old files from `recordings/` |
+| `retry-failed-tasks.sh` | Re-queues long-form jobs whose log ends in a recoverable failure (GPU OOM, dead worker), reusing the original `stt_id`; dry-run by default, `--requeue` to act |
+| `retry-failed-tasks.py` | Dispatch half of the above — runs inside the `application` container, repoints the Redis `stt_id` → `task_id` mapping at the new task |
 | `config.env` | Non-secret config committed to git (model names, Redis settings, cleanup schedule) |
 | `.env.secrets` | HuggingFace token — gitignored, create from `.env.secrets.example` |
 

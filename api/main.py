@@ -194,12 +194,33 @@ async def get_status(stt_id: str = Depends(validate_stt_id)):
                 hostname = worker_hostname.replace('celery@', '')
                 heartbeat = task_store.redis_client.get(f'worker:ready:{hostname}')
                 if heartbeat is None:
-                    task_status = "FAILURE"
-                    task_error = (
-                        f"Worker {hostname} is no longer responding. "
-                        f"The task likely failed due to the worker crashing (e.g. GPU out of memory). "
-                        f"Please resubmit the job."
-                    )
+                    # Heartbeat expired, but check if the log file was recently
+                    # updated — during long transcriptions the threading.Timer
+                    # heartbeat can't always fire (GIL blocked by GPU work),
+                    # but progress lines are still being written to the log.
+                    log_file_path = os.path.join(UPLOAD_DIR, f"{stt_id}.log")
+                    log_stale = True
+                    if Path(log_file_path).is_file():
+                        import time
+                        log_age = time.time() - os.path.getmtime(log_file_path)
+                        if log_age < 300:  # log updated in last 5 minutes
+                            log_stale = False
+                    if log_stale:
+                        task_status = "FAILURE"
+                        task_error = (
+                            "The worker processing this task is no longer responding. "
+                            "It likely crashed (e.g. GPU out of memory)."
+                        )
+                        # Persist to log file once
+                        try:
+                            existing = open(log_file_path, 'r', encoding='utf-8').read() if Path(log_file_path).is_file() else ""
+                            if "is no longer responding" not in existing:
+                                from datetime import datetime
+                                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
+                                with open(log_file_path, 'a', encoding='utf-8') as lf:
+                                    lf.write(f"{timestamp} - ERROR - [API] {task_error}\n")
+                        except Exception:
+                            pass
 
     # Read the log file if it exists
     log_content = []

@@ -632,6 +632,30 @@ Yna, ewch wedyn i http://localhost:5511
 - Galluogi ailgylchu `max-tasks-per-child` gweithwyr (eisoes wedi'i ffurfweddu)
 - Graddio i lawr nifer y gweithwyr
 - Defnyddio model Whisper llai
+- Adfer y tasgau a fethodd wedyn — gweler isod
+
+### Ailgeisio tasgau sydd wedi methu
+
+Pan fydd tasg hir yn methu (allan o gof GPU, neu weithiwr yn marw), mae ei ffeil
+`.wav` yn aros yn `recordings/`, felly gellir ei hail-anfon heb ofyn i'r
+defnyddiwr uwchlwytho eto:
+
+```bash
+./retry-failed-tasks.sh              # rhediad sych — dangos beth fyddai'n cael ei ail-anfon
+./retry-failed-tasks.sh --requeue    # ail-anfon go iawn
+```
+
+Opsiynau: `--since <dyddiau>` (rhagosodiad 7), `--priority <0-9>` (rhagosodiad
+9 = isel, felly caiff ceisiadau byw eu gwasanaethu gyntaf), `--pattern
+'<regex>'` i chwilio am fethiant gwahanol.
+
+Mae'r canlyniadau'n cael eu hysgrifennu o dan yr `stt_id` **gwreiddiol**, felly
+mae `/get_status/`, `/get_json/`, `/get_srt/` ayb yn parhau i weithio ar gyfer
+cleientiaid sy'n dal yr ID o'r ymgais a fethodd.
+
+Dim ond tasgau hir sy'n ysgrifennu ffeil log, felly dim ond y rheini y gellir eu
+hadfer fel hyn. Hepgorir tasgau alinio — mae angen testun y galwr, nad yw'n cael
+ei gadw.
 
 ### Trawsgrifio araf
 - Defnyddio modd GPU yn lle CPU
@@ -1245,6 +1269,29 @@ Then navigate to http://localhost:5511
 - Enable `max-tasks-per-child` worker recycling (already configured)
 - Scale down number of workers
 - Use smaller Whisper model
+- Then recover the jobs that failed — see below
+
+### Retrying failed tasks
+
+When a long-form task fails (GPU out of memory, or a worker dying mid-task) its
+`.wav` stays in `recordings/`, so it can be re-queued without asking the user to
+upload again:
+
+```bash
+./retry-failed-tasks.sh              # dry run — show what would be re-queued
+./retry-failed-tasks.sh --requeue    # actually re-queue
+```
+
+Options: `--since <days>` (default 7), `--priority <0-9>` (default 9 = low, so
+live requests are still served first), `--pattern '<regex>'` to match a
+different failure.
+
+Results are written under the **original** `stt_id`, so `/get_status/`,
+`/get_json/`, `/get_srt/` etc. keep working for clients still holding the ID
+from the failed attempt.
+
+Only long-form tasks write a log file, so only those can be recovered this way.
+Alignment tasks are skipped — they need the caller's text, which isn't stored.
 
 ### Slow transcription
 - Use GPU mode instead of CPU
